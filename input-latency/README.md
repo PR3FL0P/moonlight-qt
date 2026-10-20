@@ -49,6 +49,21 @@ measured input delay.
 ACK is more than five seconds old. `unsupported host` means the server did not
 advertise the extension; ordinary input remains compatible with stock Sunshine.
 
+## Download a Windows build from GitHub Actions
+
+Open [Windows Input Latency Build](https://github.com/PR3FL0P/Sunshine/actions/workflows/windows-input-latency.yml).
+A successful run provides the **Sunshine-Windows-x64-input-latency** artifact.
+Download and extract the artifact, then extract its inner Sunshine ZIP. The inner ZIP contains
+`sunshine.exe` and the required assets. The artifact also includes a SHA-256
+checksum and source commit details.
+You do not need MSYS2 or a local compiler to use this package.
+
+To start another build, select **Run workflow** and the `input-latency` branch.
+The workflow builds Windows x64, runs the receipt parser tests, and retains its
+artifact for 30 days. The package is unsigned. Stop the installed Sunshine and
+back up its configuration before running a custom build. A separate configuration
+may require pairing again.
+
 ## Sunshine on Windows x64
 
 The host changes are based on Sunshine **v2026.1018.5342**, commit

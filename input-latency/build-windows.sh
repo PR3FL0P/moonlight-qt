@@ -15,6 +15,7 @@ pacman -S --needed --noconfirm git \
     mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-cppwinrt \
     mingw-w64-ucrt-x86_64-curl-winssl mingw-w64-ucrt-x86_64-miniupnpc \
     mingw-w64-ucrt-x86_64-onevpl mingw-w64-ucrt-x86_64-openssl \
+    mingw-w64-ucrt-x86_64-libtiff mingw-w64-ucrt-x86_64-harfbuzz \
     mingw-w64-ucrt-x86_64-opus mingw-w64-ucrt-x86_64-toolchain \
     mingw-w64-ucrt-x86_64-qt6-static mingw-w64-ucrt-x86_64-MinHook \
     mingw-w64-ucrt-x86_64-nsis
