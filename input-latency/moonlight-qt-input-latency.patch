@@ -1,0 +1,343 @@
+diff --git a/app/streaming/input/mouse.cpp b/app/streaming/input/mouse.cpp
+index c5bd1fd..b791cee 100644
+--- a/app/streaming/input/mouse.cpp
++++ b/app/streaming/input/mouse.cpp
+@@ -4,6 +4,16 @@
+ #include "SDL_compat.h"
+ #include "streaming/streamutils.h"
+ 
++// SDL event timestamps and LiGetMicroseconds() have different epochs.
++// Unsigned subtraction also handles SDL's 32-bit tick counter wrapping.
++static uint64_t mouseEventTimeUs(Uint32 timestamp)
++{
++    uint64_t now = LiGetMicroseconds();
++    Uint32 ageMs = SDL_GetTicks() - timestamp;
++    uint64_t ageUs = uint64_t(ageMs) * 1000;
++    return timestamp != 0 && ageUs <= now ? now - ageUs : now;
++}
++
+ void SdlInputHandler::notifyMouseLeave()
+ {
+     if (m_NeedsManualCaptureOnLeave) {
+@@ -84,10 +94,10 @@ void SdlInputHandler::handleMouseButtonEvent(SDL_MouseButtonEvent* event)
+             button = BUTTON_RIGHT;
+     }
+ 
+-    LiSendMouseButtonEvent(event->state == SDL_PRESSED ?
++    LiSendMouseButtonEventWithTimestamp(event->state == SDL_PRESSED ?
+                                BUTTON_ACTION_PRESS :
+                                BUTTON_ACTION_RELEASE,
+-                           button);
++                           button, mouseEventTimeUs(event->timestamp));
+ }
+ 
+ void SdlInputHandler::handleMouseMotionEvent(SDL_MouseMotionEvent* event)
+@@ -101,11 +111,24 @@ void SdlInputHandler::handleMouseMotionEvent(SDL_MouseMotionEvent* event)
+         return;
+     }
+ 
+-    // Batch all pending mouse motion events to save CPU time
++    uint64_t timestampUs = mouseEventTimeUs(event->timestamp);
++
++    // Only batch consecutive motion events at the head of the queue. Looking
++    // ahead past a button event can move the host cursor before that click is
++    // sent. Limit each batch so a busy mouse cannot monopolize the event loop.
+     Sint32 x = event->x, y = event->y, xrel = event->xrel, yrel = event->yrel;
+-    SDL_Event nextEvent;
+-    while (SDL_PeepEvents(&nextEvent, 1, SDL_GETEVENT, SDL_MOUSEMOTION, SDL_MOUSEMOTION) > 0) {
+-        event = &nextEvent.motion;
++    SDL_Event motionEvents[64];
++    int pendingEvents = SDL_PeepEvents(motionEvents, SDL_arraysize(motionEvents),
++                                     SDL_PEEKEVENT, SDL_FIRSTEVENT, SDL_LASTEVENT);
++    int motionCount = 0;
++    while (motionCount < pendingEvents && motionEvents[motionCount].type == SDL_MOUSEMOTION) {
++        motionCount++;
++    }
++
++    int batchedEvents = motionCount > 0 ?
++                SDL_PeepEvents(motionEvents, motionCount, SDL_GETEVENT, SDL_MOUSEMOTION, SDL_MOUSEMOTION) : 0;
++    for (int i = 0; i < batchedEvents; i++) {
++        event = &motionEvents[i].motion;
+ 
+         // Ignore synthetic mouse events
+         if (event->which != SDL_TOUCH_MOUSEID) {
+@@ -158,7 +181,7 @@ void SdlInputHandler::handleMouseMotionEvent(SDL_MouseMotionEvent* event)
+             }
+         }
+         if (mouseInVideoRegion || m_MouseWasInVideoRegion || m_PendingMouseButtonsAllUpOnVideoRegionLeave) {
+-            LiSendMousePositionEvent((short)x, (short)y, dst.w, dst.h);
++            LiSendMousePositionEventWithTimestamp((short)x, (short)y, dst.w, dst.h, timestampUs);
+         }
+ 
+         // Adjust the cursor visibility if applicable
+@@ -174,7 +197,7 @@ void SdlInputHandler::handleMouseMotionEvent(SDL_MouseMotionEvent* event)
+         m_MouseWasInVideoRegion = mouseInVideoRegion;
+     }
+     else {
+-        LiSendMouseMoveEvent(xrel, yrel);
++        LiSendMouseMoveEventWithTimestamp(xrel, yrel, timestampUs);
+     }
+ }
+ 
+diff --git a/app/streaming/video/ffmpeg.cpp b/app/streaming/video/ffmpeg.cpp
+index c20d312..d6aadfe 100644
+--- a/app/streaming/video/ffmpeg.cpp
++++ b/app/streaming/video/ffmpeg.cpp
+@@ -943,6 +943,33 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
+         offset += ret;
+     }
+ 
++    // Receipt ACK includes client event queuing and both network directions.
++    // Keep this separate from ENet RTT and never present RTT/2 as measured input latency.
++    char mouseAck[2][48];
++    for (int i = 0; i < 2; i++) {
++        LI_MOUSE_ACK_STATS ack = {};
++        if (!LiGetMouseAckStats(i != 0, &ack)) {
++            snprintf(mouseAck[i], sizeof(mouseAck[i]), "unsupported host");
++        }
++        else if (ack.sampleCount == 0) {
++            snprintf(mouseAck[i], sizeof(mouseAck[i]), "waiting for input");
++        }
++        else if (LiGetMicroseconds() - ack.lastAckTimeUs > 5000000) {
++            snprintf(mouseAck[i], sizeof(mouseAck[i]), "%.1f ms (stale)", ack.lastDelayUs / 1000.0);
++        }
++        else {
++            snprintf(mouseAck[i], sizeof(mouseAck[i]), "%.1f ms", ack.lastDelayUs / 1000.0);
++        }
++    }
++    ret = snprintf(&output[offset], length - offset,
++                   "Mouse receipt ACK (round trip) click/move: %s / %s\n",
++                   mouseAck[0], mouseAck[1]);
++    if (ret < 0 || ret >= length - offset) {
++        SDL_assert(false);
++        return;
++    }
++    offset += ret;
++
+     if (stats.renderedFrames != 0) {
+         char rttString[32];
+ 
+@@ -979,7 +1006,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
+ void FFmpegVideoDecoder::logVideoStats(VIDEO_STATS& stats, const char* title)
+ {
+     if (stats.renderedFps > 0 || stats.renderedFrames != 0) {
+-        char videoStatsStr[512];
++        char videoStatsStr[1536];
+         stringifyVideoStats(stats, videoStatsStr, sizeof(videoStatsStr));
+ 
+         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+diff --git a/app/streaming/video/overlaymanager.h b/app/streaming/video/overlaymanager.h
+index 8f8a60b..f2f832b 100644
+--- a/app/streaming/video/overlaymanager.h
++++ b/app/streaming/video/overlaymanager.h
+@@ -47,7 +47,7 @@ private:
+         bool enabled;
+         int fontSize;
+         SDL_Color color;
+-        char text[1024];
++        char text[1536];
+ 
+         TTF_Font* font;
+         SDL_Surface* surface;
+diff --git a/scripts/test-input-latency.py b/scripts/test-input-latency.py
+new file mode 100644
+index 0000000..575dbdb
+--- /dev/null
++++ b/scripts/test-input-latency.py
+@@ -0,0 +1,196 @@
++#!/usr/bin/env python3
++"""Exercise actual client envelope/ACK code and Sunshine parser without a live stream.
++
++Usage: python3 scripts/test-input-latency.py /path/to/Sunshine-input-latency
++The full Windows server and live network path still require testing on Windows.
++"""
++import os
++import pathlib
++import re
++import subprocess
++import sys
++import tempfile
++
++ROOT = pathlib.Path(__file__).resolve().parents[1]
++SUNSHINE = pathlib.Path(sys.argv[1]).resolve()
++COMMON = ROOT / "moonlight-common-c/moonlight-common-c/src"
++sender = (COMMON / "InputStream.c").read_text()
++wrapper = sender[sender.index("    unsigned char wrappedPacket"):sender.index("    // On GFE 3.22,")]
++control = (COMMON / "ControlStream.c").read_text()
++handler = control[control.index("static void handleMouseReceiptAck"):control.index("#define IDX_START_A")]
++constants = "\n".join(re.findall(r"^#define SS_INPUT_LATENCY_.*$", (COMMON / "Limelight-internal.h").read_text(), re.M))
++stream = (SUNSHINE / "src/stream.cpp").read_text()
++receiver = stream[stream.index("  void receive_input("):stream.index("  /**\n   * @brief Run the broadcast control-channel worker thread.")]
++harness = r'''#include <cassert>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++#include <string_view>
++#include <string>
++#include <cstdint>
++#include <algorithm>
++#include "Limelight.h"
++#include "Input.h"
++#include "input_latency.h"
++#define LE32(x) (x)
++#define LE64(x) (x)
++#define BE32(x) __builtin_bswap32(x)
++CONSTANTS
++#define MAX_INPUT_PACKET_SIZE 128
++#define LC_ASSERT(x) assert(x)
++#define PACKET_SIZE(x) (BE32((x)->packet.header.size) + 4)
++struct Holder {
++    uint64_t timestampUs;
++    union { NV_INPUT_HEADER header; NV_REL_MOUSE_MOVE_PACKET move; NV_ABS_MOUSE_MOVE_PACKET abs; NV_MOUSE_BUTTON_PACKET button; } packet;
++};
++uint32_t InputLatencyProtocol = 1;
++bool encryptedControlStream = true;
++uint64_t lastMouseLatencySampleUs = 0;
++uint64_t clockUs = 1000000;
++uint64_t LiGetMicroseconds() { return clockUs; }
++std::vector<unsigned char> wrap(Holder* holder, bool& moreData) {
++WRAPPER
++    return {packetData, packetData + packetSize};
++}
++int enetMutex;
++int lockCount;
++void PltLockMutex(int*) { ++lockCount; }
++void PltUnlockMutex(int*) { --lockCount; }
++LI_MOUSE_ACK_STATS mouseAckStats[2] = {};
++HANDLER
++// Only transport/cipher and input queue boundaries are mocked here.
++namespace input {
++    std::vector<std::vector<uint8_t>> received;
++    void passthrough(int&, std::vector<uint8_t>&& bytes) { received.push_back(std::move(bytes)); }
++}
++struct MockServer {
++    std::vector<std::string> sent;
++    int flushCount = 0;
++    int send(std::string_view bytes, bool) { sent.emplace_back(bytes); return 0; }
++    void flush() { ++flushCount; }
++};
++struct Broadcast { MockServer control_server; };
++struct session_t { int input; struct { bool peer = true; } control; Broadcast* broadcast_ref; };
++bool encryptionFails = false;
++template<size_t N>
++std::string_view encode_control(session_t*, std::string_view bytes, std::array<uint8_t, N>&) {
++    return encryptionFails ? std::string_view{} : bytes;
++}
++RECEIVER
++Holder holder(uint32_t magic, int size) {
++    Holder h = {};
++    h.timestampUs = clockUs - 5000;
++    h.packet.header.magic = magic;
++    h.packet.header.size = BE32(size - 4);
++    return h;
++}
++void checkPacket(uint32_t magic, int size) {
++    auto h = holder(magic, size);
++    lastMouseLatencySampleUs = 0;
++    bool more = true;
++    auto bytes = wrap(&h, more);
++    assert(!more && h.timestampUs == 0);
++    auto receipt = input_latency::parse(bytes);
++    assert(receipt && receipt->input.size() == unsigned(size));
++    assert(std::memcmp(receipt->input.data(), &h.packet, size) == 0);
++    Broadcast broadcast;
++    session_t session {0, {}, &broadcast};
++    input::received.clear();
++    receive_input(&session, std::vector<uint8_t>(bytes));
++    assert(input::received.size() == 1 && input::received[0].size() == unsigned(size));
++    assert(std::memcmp(input::received[0].data(), &h.packet, size) == 0);
++    assert(broadcast.control_server.sent.size() == 1 && broadcast.control_server.flushCount == 1);
++    auto response = broadcast.control_server.sent[0];
++    assert(response.size() == 16 && uint8_t(response[0]) == 0xf0 && uint8_t(response[1]) == 0x55);
++    assert(response[2] == 12 && response[3] == 0);
++    assert(std::memcmp(response.data() + 4, receipt->ack.data(), 12) == 0);
++    // Missing peer and encryption failure still forward input, but cannot send an ACK.
++    session.control.peer = false;
++    receive_input(&session, std::vector<uint8_t>(bytes));
++    session.control.peer = true;
++    encryptionFails = true;
++    receive_input(&session, std::vector<uint8_t>(bytes));
++    encryptionFails = false;
++    assert(input::received.size() == 3 && broadcast.control_server.sent.size() == 1);
++    // A standard packet is forwarded without an acknowledgement.
++    receive_input(&session, std::vector<uint8_t>(receipt->input.begin(), receipt->input.end()));
++    assert(input::received.size() == 4 && broadcast.control_server.sent.size() == 1);
++    auto corruptEnvelope = bytes;
++    corruptEnvelope[3] ^= 1;
++    receive_input(&session, std::move(corruptEnvelope));
++    assert(input::received.size() == 4 && broadcast.control_server.sent.size() == 1);
++    clockUs += 7000;
++    handleMouseReceiptAck(receipt->ack.data(), receipt->ack.size());
++    int index = (magic == 5 || magic == 7) ? 1 : 0;
++    assert(mouseAckStats[index].lastDelayUs == 12000);
++    assert(mouseAckStats[index].lastAckTimeUs == clockUs && lockCount == 0);
++    // Every truncated envelope must be rejected.
++    for (size_t i = 0; i < bytes.size(); ++i) {
++        assert(!input_latency::parse(std::span(bytes).first(i)));
++    }
++    for (auto offset : {3, 4, 7, 19, 20}) {
++        auto corrupt = bytes;
++        corrupt[offset] ^= 1;
++        // 8 XOR 1 is 9: another valid button type.
++        if (offset == 20 && (magic == 8 || magic == 9)) continue;
++        assert(!input_latency::parse(corrupt));
++    }
++    // Truncated, future, and obsolete ACKs cannot replace the last sample.
++    auto saved = mouseAckStats[index];
++    handleMouseReceiptAck(receipt->ack.data(), 11);
++    std::array<uint8_t, 12> invalid = receipt->ack;
++    uint64_t future = clockUs + 1;
++    std::memcpy(invalid.data(), &future, 8);
++    handleMouseReceiptAck(invalid.data(), 12);
++    uint64_t old = clockUs - 500000;
++    std::memcpy(invalid.data(), &old, 8);
++    handleMouseReceiptAck(invalid.data(), 12);
++    assert(mouseAckStats[index].sampleCount == saved.sampleCount);
++}
++int main() {
++    checkPacket(7, sizeof(NV_REL_MOUSE_MOVE_PACKET));
++    checkPacket(5, sizeof(NV_ABS_MOUSE_MOVE_PACKET));
++    checkPacket(8, sizeof(NV_MOUSE_BUTTON_PACKET));
++    checkPacket(9, sizeof(NV_MOUSE_BUTTON_PACKET));
++    bool more = true;
++    auto h = holder(7, sizeof(NV_REL_MOUSE_MOVE_PACKET));
++    lastMouseLatencySampleUs = clockUs;
++    auto bytes = wrap(&h, more);
++    assert(bytes.size() == sizeof(NV_REL_MOUSE_MOVE_PACKET) && more);
++    clockUs += 100000;
++    bytes = wrap(&h, more);
++    assert(input_latency::parse(bytes) && !more);
++    InputLatencyProtocol = 0;
++    for (auto magic : {5u, 7u, 8u, 9u}) {
++        h = holder(magic, sizeof(NV_MOUSE_BUTTON_PACKET));
++        more = true;
++        bytes = wrap(&h, more);
++        assert(bytes.size() == sizeof(NV_MOUSE_BUTTON_PACKET) && more);
++        assert(std::memcmp(bytes.data(), &h.packet, bytes.size()) == 0);
++    }
++    InputLatencyProtocol = 1;
++    encryptedControlStream = false;
++    h = holder(8, sizeof(NV_MOUSE_BUTTON_PACKET));
++    bytes = wrap(&h, more);
++    assert(bytes.size() == sizeof(NV_MOUSE_BUTTON_PACKET));
++    // Unknown or nested packet types and incorrect inner lengths are rejected.
++    std::vector<uint8_t> malformed(28);
++    malformed[3] = 24; malformed[4] = 0xf0; malformed[7] = 0x55;
++    malformed[19] = 8; malformed[20] = 3;
++    assert(!input_latency::parse(malformed));
++    malformed[20] = 0xf0; malformed[23] = 0x55;
++    assert(!input_latency::parse(malformed));
++    std::array<uint8_t, 5> endian {0, 0x12, 0x34, 0x56, 0x78};
++    assert(input_latency::read32(endian.data() + 1, true) == 0x12345678u);
++    assert(input_latency::read32(endian.data() + 1, false) == 0x78563412u);
++    puts("PASS: client/server envelope compatibility, both motion modes, buttons, ACK timing, invalid/stale ACKs, malformed packets, rate limit, stock-host fallback");
++}
++'''.replace("RECEIVER", receiver).replace("CONSTANTS", constants).replace("WRAPPER", wrapper).replace("HANDLER", handler)
++with tempfile.TemporaryDirectory(prefix="moonlight-input-latency-") as tmp:
++    source = pathlib.Path(tmp) / "protocol.cpp"
++    binary = pathlib.Path(tmp) / "protocol"
++    source.write_text(harness)
++    subprocess.run([os.environ.get("CXX", "g++"), "-std=c++20", "-Wall", "-Wextra", "-Werror", "-Wno-sign-compare",
++                    *os.environ.get("TEST_SANITIZERS", "").split(), "-g", str(source), "-I", str(COMMON),
++                    "-I", str(SUNSHINE / "src"), "-o", str(binary)], check=True)
++    subprocess.run([str(binary)], check=True)

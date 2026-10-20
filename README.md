@@ -1,5 +1,13 @@
 # Moonlight PC
 
+## Experimental mouse receipt ACK build
+
+This fork adds click and mouse movement receipt measurements to the performance
+overlay and preserves mouse event order when batching movements. It requires the
+[matching Sunshine host](https://github.com/PR3FL0P/Sunshine/tree/input-latency)
+for receipt measurements. See the [setup, Windows build bundle, and measurement limitations](input-latency/README.md).
+
+
 [Moonlight PC](https://moonlight-stream.org) is an open source PC client for NVIDIA GameStream and [Sunshine](https://github.com/LizardByte/Sunshine).
 
 Moonlight also has mobile versions for [Android](https://github.com/moonlight-stream/moonlight-android) and [iOS](https://github.com/moonlight-stream/moonlight-ios).

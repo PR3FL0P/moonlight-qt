@@ -943,6 +943,33 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
         offset += ret;
     }
 
+    // Receipt ACK includes client event queuing and both network directions.
+    // Keep this separate from ENet RTT and never present RTT/2 as measured input latency.
+    char mouseAck[2][48];
+    for (int i = 0; i < 2; i++) {
+        LI_MOUSE_ACK_STATS ack = {};
+        if (!LiGetMouseAckStats(i != 0, &ack)) {
+            snprintf(mouseAck[i], sizeof(mouseAck[i]), "unsupported host");
+        }
+        else if (ack.sampleCount == 0) {
+            snprintf(mouseAck[i], sizeof(mouseAck[i]), "waiting for input");
+        }
+        else if (LiGetMicroseconds() - ack.lastAckTimeUs > 5000000) {
+            snprintf(mouseAck[i], sizeof(mouseAck[i]), "%.1f ms (stale)", ack.lastDelayUs / 1000.0);
+        }
+        else {
+            snprintf(mouseAck[i], sizeof(mouseAck[i]), "%.1f ms", ack.lastDelayUs / 1000.0);
+        }
+    }
+    ret = snprintf(&output[offset], length - offset,
+                   "Mouse receipt ACK (round trip) click/move: %s / %s\n",
+                   mouseAck[0], mouseAck[1]);
+    if (ret < 0 || ret >= length - offset) {
+        SDL_assert(false);
+        return;
+    }
+    offset += ret;
+
     if (stats.renderedFrames != 0) {
         char rttString[32];
 
@@ -979,7 +1006,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
 void FFmpegVideoDecoder::logVideoStats(VIDEO_STATS& stats, const char* title)
 {
     if (stats.renderedFps > 0 || stats.renderedFrames != 0) {
-        char videoStatsStr[512];
+        char videoStatsStr[1536];
         stringifyVideoStats(stats, videoStatsStr, sizeof(videoStatsStr));
 
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,

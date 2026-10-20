@@ -4,6 +4,16 @@
 #include "SDL_compat.h"
 #include "streaming/streamutils.h"
 
+// SDL event timestamps and LiGetMicroseconds() have different epochs.
+// Unsigned subtraction also handles SDL's 32-bit tick counter wrapping.
+static uint64_t mouseEventTimeUs(Uint32 timestamp)
+{
+    uint64_t now = LiGetMicroseconds();
+    Uint32 ageMs = SDL_GetTicks() - timestamp;
+    uint64_t ageUs = uint64_t(ageMs) * 1000;
+    return timestamp != 0 && ageUs <= now ? now - ageUs : now;
+}
+
 void SdlInputHandler::notifyMouseLeave()
 {
     if (m_NeedsManualCaptureOnLeave) {
@@ -84,10 +94,10 @@ void SdlInputHandler::handleMouseButtonEvent(SDL_MouseButtonEvent* event)
             button = BUTTON_RIGHT;
     }
 
-    LiSendMouseButtonEvent(event->state == SDL_PRESSED ?
+    LiSendMouseButtonEventWithTimestamp(event->state == SDL_PRESSED ?
                                BUTTON_ACTION_PRESS :
                                BUTTON_ACTION_RELEASE,
-                           button);
+                           button, mouseEventTimeUs(event->timestamp));
 }
 
 void SdlInputHandler::handleMouseMotionEvent(SDL_MouseMotionEvent* event)
@@ -101,11 +111,24 @@ void SdlInputHandler::handleMouseMotionEvent(SDL_MouseMotionEvent* event)
         return;
     }
 
-    // Batch all pending mouse motion events to save CPU time
+    uint64_t timestampUs = mouseEventTimeUs(event->timestamp);
+
+    // Only batch consecutive motion events at the head of the queue. Looking
+    // ahead past a button event can move the host cursor before that click is
+    // sent. Limit each batch so a busy mouse cannot monopolize the event loop.
     Sint32 x = event->x, y = event->y, xrel = event->xrel, yrel = event->yrel;
-    SDL_Event nextEvent;
-    while (SDL_PeepEvents(&nextEvent, 1, SDL_GETEVENT, SDL_MOUSEMOTION, SDL_MOUSEMOTION) > 0) {
-        event = &nextEvent.motion;
+    SDL_Event motionEvents[64];
+    int pendingEvents = SDL_PeepEvents(motionEvents, SDL_arraysize(motionEvents),
+                                     SDL_PEEKEVENT, SDL_FIRSTEVENT, SDL_LASTEVENT);
+    int motionCount = 0;
+    while (motionCount < pendingEvents && motionEvents[motionCount].type == SDL_MOUSEMOTION) {
+        motionCount++;
+    }
+
+    int batchedEvents = motionCount > 0 ?
+                SDL_PeepEvents(motionEvents, motionCount, SDL_GETEVENT, SDL_MOUSEMOTION, SDL_MOUSEMOTION) : 0;
+    for (int i = 0; i < batchedEvents; i++) {
+        event = &motionEvents[i].motion;
 
         // Ignore synthetic mouse events
         if (event->which != SDL_TOUCH_MOUSEID) {
@@ -158,7 +181,7 @@ void SdlInputHandler::handleMouseMotionEvent(SDL_MouseMotionEvent* event)
             }
         }
         if (mouseInVideoRegion || m_MouseWasInVideoRegion || m_PendingMouseButtonsAllUpOnVideoRegionLeave) {
-            LiSendMousePositionEvent((short)x, (short)y, dst.w, dst.h);
+            LiSendMousePositionEventWithTimestamp((short)x, (short)y, dst.w, dst.h, timestampUs);
         }
 
         // Adjust the cursor visibility if applicable
@@ -174,7 +197,7 @@ void SdlInputHandler::handleMouseMotionEvent(SDL_MouseMotionEvent* event)
         m_MouseWasInVideoRegion = mouseInVideoRegion;
     }
     else {
-        LiSendMouseMoveEvent(xrel, yrel);
+        LiSendMouseMoveEventWithTimestamp(xrel, yrel, timestampUs);
     }
 }
 

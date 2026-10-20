@@ -1,0 +1,254 @@
+diff --git a/src/rtsp.cpp b/src/rtsp.cpp
+index 7125373..20cc94f 100644
+--- a/src/rtsp.cpp
++++ b/src/rtsp.cpp
+@@ -877,6 +877,8 @@ namespace rtsp_stream {
+     // Tell the client about our supported features
+     ss << "a=x-ss-general.featureFlags:" << (uint32_t) platf::get_capabilities() << std::endl;
+ 
++    ss << "a=x-ss-input-latency:1" << std::endl;
++
+     // Always request new control stream encryption if the client supports it
+     uint32_t encryption_flags_supported = SS_ENC_CONTROL_V2 | SS_ENC_AUDIO;
+     uint32_t encryption_flags_requested = SS_ENC_CONTROL_V2;
+diff --git a/src/stream.cpp b/src/stream.cpp
+index 2f2db0c..beaa7b9 100644
+--- a/src/stream.cpp
++++ b/src/stream.cpp
+@@ -28,6 +28,7 @@ extern "C" {
+ #include "display_device.h"
+ #include "globals.h"
+ #include "input.h"
++#include "input_latency.h"
+ #include "logging.h"
+ #include "network.h"
+ #include "platform/common.h"
+@@ -1169,6 +1170,39 @@ namespace stream {
+     return 0;
+   }
+ 
++  /**
++   * @brief Queue normal input or unwrap a measured mouse packet and acknowledge receipt.
++   * @details Runs on the control thread so control cipher state remains serialized.
++   * The ACK confirms enqueueing only, not Windows injection or game processing.
++   * @param session Stream receiving the input.
++   * @param plaintext Decrypted input packet.
++   */
++  void receive_input(session_t *session, std::vector<std::uint8_t> &&plaintext) {
++    if (plaintext.size() < 8 || input_latency::read32(plaintext.data() + 4, false) != input_latency::envelope_magic) {
++      input::passthrough(session->input, std::move(plaintext));
++      return;
++    }
++    auto receipt = input_latency::parse(plaintext);
++    if (!receipt) {
++      return;
++    }
++    std::vector<std::uint8_t> original(receipt->input.begin(), receipt->input.end());
++    input::passthrough(session->input, std::move(original));
++
++    // Construct the complete V2 header explicitly to avoid padding or byte-order assumptions.
++    std::array<std::uint8_t, 16> response {};
++    response[0] = input_latency::ack_type & 0xFF;
++    response[1] = input_latency::ack_type >> 8;
++    response[2] = receipt->ack.size();
++    std::memcpy(response.data() + 4, receipt->ack.data(), receipt->ack.size());
++    std::array<std::uint8_t, 128> encrypted {};
++    auto payload = encode_control(session, std::string_view(reinterpret_cast<const char *>(response.data()), response.size()), encrypted);
++    if (!payload.empty() && session->control.peer) {
++      session->broadcast_ref->control_server.send(payload, session->control.peer);
++      session->broadcast_ref->control_server.flush();
++    }
++  }
++
+   /**
+    * @brief Run the broadcast control-channel worker thread.
+    *
+@@ -1245,7 +1279,7 @@ namespace stream {
+         std::copy(payload.end() - 16, payload.end(), std::begin(iv));
+       }
+ 
+-      input::passthrough(session->input, std::move(plaintext));
++      receive_input(session, std::move(plaintext));
+     });
+ 
+     server->map(packetTypes[IDX_ENCRYPTED], [server](session_t *session, const std::string_view &payload) {
+@@ -1308,7 +1342,7 @@ namespace stream {
+       // IDX_INPUT_DATA callback will attempt to decrypt unencrypted data, therefore we need pass it directly
+       if (type == packetTypes[IDX_INPUT_DATA]) {
+         plaintext.erase(std::begin(plaintext), std::begin(plaintext) + 4);
+-        input::passthrough(session->input, std::move(plaintext));
++        receive_input(session, std::move(plaintext));
+       } else {
+         server->call(type, session, next_payload, true);
+       }
+diff --git a/src/input_latency.h b/src/input_latency.h
+new file mode 100644
+index 0000000..cc8259e
+--- /dev/null
++++ b/src/input_latency.h
+@@ -0,0 +1,75 @@
++/**
++ * @file src/input_latency.h
++ * @brief Private version-one mouse receipt acknowledgement envelope validation.
++ */
++#pragma once
++
++// standard includes
++#include <array>
++#include <cstdint>
++#include <cstring>
++#include <optional>
++#include <span>
++
++namespace input_latency {
++  constexpr std::uint32_t envelope_magic = 0x550000F0;  ///< Private mouse envelope type.
++  constexpr std::uint16_t ack_type = 0x55F0;  ///< Private receipt ACK control message type.
++
++  /**
++   * @brief Validated mouse input and opaque timestamp returned to the client.
++   */
++  struct receipt_t {
++    std::span<const std::uint8_t> input;  ///< Original input packet without its envelope.
++    std::array<std::uint8_t, 12> ack;  ///< Client timestamp and original packet magic, little endian.
++  };
++
++  /**
++   * @brief Read a protocol integer without alignment or native-endianness assumptions.
++   * @param data At least four bytes of protocol data.
++   * @param big Whether the integer uses big endian byte order.
++   * @return Decoded unsigned integer.
++   */
++  inline std::uint32_t read32(const std::uint8_t *data, bool big) {
++    std::uint32_t value = 0;
++    for (int i = 0; i < 4; ++i) {
++      value |= std::uint32_t(data[big ? 3 - i : i]) << (8 * i);
++    }
++    return value;
++  }
++
++  /**
++   * @brief Validate an envelope containing exactly one mouse packet.
++   * @param packet Complete raw envelope, including both input headers.
++   * @return Original mouse input and receipt payload, or no value for malformed input.
++   */
++  inline std::optional<receipt_t> parse(std::span<const std::uint8_t> packet) {
++    constexpr std::size_t prefix_size = 16;
++    if (packet.size() < prefix_size + 8 || read32(packet.data(), true) != packet.size() - 4 || read32(packet.data() + 4, false) != envelope_magic) {
++      return std::nullopt;
++    }
++    auto input = packet.subspan(prefix_size);
++    auto magic = read32(input.data() + 4, false);
++    std::size_t expected_size;
++    switch (magic) {
++      case 7:
++        expected_size = 12;  // NV_REL_MOUSE_MOVE_PACKET
++        break;
++      case 5:
++        expected_size = 18;  // NV_ABS_MOUSE_MOVE_PACKET
++        break;
++      case 8:
++      case 9:
++        expected_size = 9;  // NV_MOUSE_BUTTON_PACKET
++        break;
++      default:
++        return std::nullopt;
++    }
++    if (input.size() != expected_size || read32(input.data(), true) != input.size() - 4) {
++      return std::nullopt;
++    }
++    receipt_t result {input, {}};
++    std::memcpy(result.ack.data(), packet.data() + 8, 8);
++    std::memcpy(result.ack.data() + 8, input.data() + 4, 4);
++    return result;
++  }
++}  // namespace input_latency
+diff --git a/tests/unit/test_input_latency.cpp b/tests/unit/test_input_latency.cpp
+new file mode 100644
+index 0000000..821fa7a
+--- /dev/null
++++ b/tests/unit/test_input_latency.cpp
+@@ -0,0 +1,84 @@
++/**
++ * @file tests/unit/test_input_latency.cpp
++ * @brief Regression coverage for private mouse receipt envelopes.
++ */
++
++// test includes
++#include "../tests_common.h"
++
++// standard includes
++#include <vector>
++
++// local includes
++#include "src/input_latency.h"
++
++namespace {
++  /**
++   * @brief Build a little-endian input envelope with a big-endian length prefix.
++   * @param magic Original mouse message type.
++   * @param size Original mouse packet size.
++   * @return Serialized measurement envelope.
++   */
++  std::vector<std::uint8_t> envelope(std::uint8_t magic, std::size_t size) {
++    std::vector<std::uint8_t> packet(16 + size);
++    packet[3] = packet.size() - 4;
++    packet[4] = 0xF0;
++    packet[7] = 0x55;
++    for (int i = 0; i < 8; ++i) {
++      packet[8 + i] = 0x80 + i;
++    }
++    packet[19] = size - 4;
++    packet[20] = magic;
++    return packet;
++  }
++}
++
++TEST(InputLatency, AcceptsMousePacketsAndPreservesOpaqueTimestamp) {
++  for (auto [magic, size] : {std::pair {7, 12}, {5, 18}, {8, 9}, {9, 9}}) {
++    auto packet = envelope(magic, size);
++    auto receipt = input_latency::parse(packet);
++    ASSERT_TRUE(receipt);
++    EXPECT_EQ(receipt->input.size(), size);
++    EXPECT_EQ(receipt->input.data(), packet.data() + 16);
++    for (int i = 0; i < 8; ++i) {
++      EXPECT_EQ(receipt->ack[i], 0x80 + i);
++    }
++    EXPECT_EQ(receipt->ack[8], magic);
++    EXPECT_EQ(receipt->ack[9], 0);
++    EXPECT_EQ(receipt->ack[10], 0);
++    EXPECT_EQ(receipt->ack[11], 0);
++  }
++}
++
++TEST(InputLatency, RejectsAllTruncatedPackets) {
++  for (auto [magic, size] : {std::pair {7, 12}, {5, 18}, {8, 9}, {9, 9}}) {
++    auto packet = envelope(magic, size);
++    for (std::size_t length = 0; length < packet.size(); ++length) {
++      EXPECT_FALSE(input_latency::parse(std::span(packet).first(length)));
++    }
++  }
++}
++
++TEST(InputLatency, RejectsLengthMismatchesUnknownTypesAndNestedEnvelopes) {
++  auto original = envelope(7, 12);
++  for (auto offset : {3, 4, 7, 19, 20}) {
++    auto packet = original;
++    packet[offset] ^= 1;
++    EXPECT_FALSE(input_latency::parse(packet));
++  }
++  auto packet = original;
++  packet.push_back(0);
++  packet[3]++;
++  EXPECT_FALSE(input_latency::parse(packet));
++  packet = original;
++  packet[20] = 0xF0;
++  packet[23] = 0x55;
++  EXPECT_FALSE(input_latency::parse(packet));
++  EXPECT_FALSE(input_latency::parse(envelope(3, 12)));
++}
++
++TEST(InputLatency, ReadsBothByteOrdersWithoutAlignmentRequirements) {
++  std::array<std::uint8_t, 5> bytes {0, 0x12, 0x34, 0x56, 0x78};
++  EXPECT_EQ(input_latency::read32(bytes.data() + 1, true), 0x12345678u);
++  EXPECT_EQ(input_latency::read32(bytes.data() + 1, false), 0x78563412u);
++}
